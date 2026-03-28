@@ -1,82 +1,105 @@
 """
-Equity-driven poker bot with:
-  - Preflop hand strength heuristic (fast, no simulation)
-  - Monte Carlo equity estimation postflop
-  - Draw detection + semi-bluff raising
-  - Hole card AND board card redraw logic
-  - Opponent modeling (VPIP, aggression factor, fold frequency)
+Equity-driven heads-up poker bot.
+
+Improvements over v1:
+  1. pkrbot.evaluate() for ground-truth hand ranking (same as engine)
+  2. Clock-aware simulation budget -- never times out
+  3. Preflop HU equity lookup table (calibrated, not formula)
+  4. Simulation-based redraw for both hole and board cards
+  5. Check-raise logic (value and bluff)
+  6. River-specific strategy: no semi-bluffs, pure bluff option
+  7. Opponent model: aggressive opponents trigger counter-aggression
 """
+
+import random
+import numpy as np
+
 from skeleton.actions import FoldAction, CallAction, CheckAction, RaiseAction, RedrawAction
 from skeleton.states import BIG_BLIND, STARTING_STACK
 from skeleton.bot import Bot
 from skeleton.runner import parse_args, run_bot
 
-from equity import estimate_equity
+from equity import estimate_equity, FULL_DECK
 from opponent_model import OpponentModel
 
 RANKS = '23456789TJQKA'
-SUITS = 'hdcs'
 RANK_VAL = {r: i for i, r in enumerate(RANKS)}
 
-# Monte Carlo simulation budget per street (postflop only)
-SIMS = {3: 800, 4: 1000, 5: 1000}
+# ── Preflop HU equity lookup table ────────────────────────────────────────────
+# Keys: (hi_rank, lo_rank, suited:bool) for unpaired; (rank, rank, None) for pairs.
 
-# Redraw: minimum equity gain required to justify swapping a hole card
-REDRAW_GAIN_THRESHOLD = {3: 0.04, 4: 0.06}  # higher bar on turn (less upside)
+_PF = {}
 
-# Equity below which we consider hole card redraw at all
-REDRAW_EQUITY_CEIL = {3: 0.52, 4: 0.44}
+def _suited(hi, lo, eq):
+    _PF[(hi, lo, True)]  = eq
+    _PF[(hi, lo, False)] = max(0.33, eq - 0.035)
 
+# Pocket pairs 22 to AA
+for _i, (_r, _eq) in enumerate(zip(RANKS, [
+    0.56, 0.57, 0.59, 0.61, 0.63, 0.65, 0.67, 0.69, 0.72, 0.75, 0.80, 0.83, 0.85
+])):
+    _PF[(_r, _r, None)] = _eq
+
+for _lo, _eq in [('K',0.67),('Q',0.66),('J',0.65),('T',0.64),('9',0.62),('8',0.61),
+                  ('7',0.60),('6',0.59),('5',0.60),('4',0.59),('3',0.58),('2',0.57)]:
+    _suited('A', _lo, _eq)
+for _lo, _eq in [('Q',0.63),('J',0.62),('T',0.61),('9',0.59),('8',0.57),('7',0.56),
+                  ('6',0.55),('5',0.54),('4',0.53),('3',0.52),('2',0.51)]:
+    _suited('K', _lo, _eq)
+for _lo, _eq in [('J',0.59),('T',0.58),('9',0.56),('8',0.54),('7',0.52),('6',0.51),
+                  ('5',0.50),('4',0.49),('3',0.48),('2',0.47)]:
+    _suited('Q', _lo, _eq)
+for _lo, _eq in [('T',0.57),('9',0.55),('8',0.53),('7',0.51),('6',0.49),
+                  ('5',0.48),('4',0.47),('3',0.46),('2',0.45)]:
+    _suited('J', _lo, _eq)
+for _lo, _eq in [('9',0.55),('8',0.53),('7',0.51),('6',0.49),
+                  ('5',0.47),('4',0.46),('3',0.45),('2',0.44)]:
+    _suited('T', _lo, _eq)
+for _hi, _entries in [
+    ('9', [('8',0.53),('7',0.51),('6',0.49),('5',0.47),('4',0.45),('3',0.44),('2',0.43)]),
+    ('8', [('7',0.51),('6',0.49),('5',0.47),('4',0.45),('3',0.44),('2',0.43)]),
+    ('7', [('6',0.49),('5',0.47),('4',0.45),('3',0.43),('2',0.42)]),
+    ('6', [('5',0.47),('4',0.45),('3',0.43),('2',0.42)]),
+    ('5', [('4',0.45),('3',0.43),('2',0.42)]),
+    ('4', [('3',0.43),('2',0.41)]),
+    ('3', [('2',0.41)]),
+]:
+    for _lo, _eq in _entries:
+        _suited(_hi, _lo, _eq)
+
+
+def preflop_equity(hole):
+    c0, c1 = hole[0], hole[1]
+    if not c0 or not c1 or c0 == '??' or c1 == '??':
+        return 0.50
+    i0 = RANK_VAL.get(c0[0], -1)
+    i1 = RANK_VAL.get(c1[0], -1)
+    if i0 < 0 or i1 < 0:
+        return 0.50
+    suited = c0[1] == c1[1]
+    hi = RANKS[max(i0, i1)]
+    lo = RANKS[min(i0, i1)]
+    if hi == lo:
+        return _PF.get((hi, lo, None), 0.52)
+    return _PF.get((hi, lo, suited),
+           _PF.get((hi, lo, not suited), 0.48) + (0.035 if suited else 0))
+
+
+# ── Helpers ────────────────────────────────────────────────────────────────────
 
 def _clean(cards):
     return [c for c in cards if c and c != '??']
 
 
-def _rank(card):
-    return RANK_VAL.get(card[0], -1)
-
-
-# ── Preflop heuristic ──────────────────────────────────────────────────────────
-
-def preflop_strength(hole):
-    """Fast heuristic equity estimate for 2 hole cards, no simulation needed."""
-    vals = sorted((_rank(c) for c in hole), reverse=True)
-    high, low = vals
-    suited = hole[0][1] == hole[1][1]
-    gap = high - low
-
-    # Pocket pair
-    if gap == 0:
-        return min(0.56 + (high / 24.0), 0.96)
-
-    strength = 0.33 + (high / 20.0) + (low / 35.0)
-    if suited:
-        strength += 0.04
-    if gap == 1:
-        strength += 0.05
-    elif gap == 2:
-        strength += 0.025
-    elif gap >= 4:
-        strength -= 0.05
-    if high >= RANK_VAL['Q'] and low >= RANK_VAL['T']:
-        strength += 0.05
-    return max(0.12, min(strength, 0.90))
-
-
-# ── Draw detection ─────────────────────────────────────────────────────────────
-
 def has_flush_draw(hole, board):
-    """True if 4+ cards of the same suit between hole and board."""
-    all_cards = _clean(hole + board)
-    suit_counts = {}
-    for c in all_cards:
-        suit_counts[c[1]] = suit_counts.get(c[1], 0) + 1
-    return max(suit_counts.values(), default=0) >= 4
+    counts = {}
+    for c in _clean(hole + board):
+        counts[c[1]] = counts.get(c[1], 0) + 1
+    return max(counts.values(), default=0) >= 4
 
 
 def has_straight_draw(hole, board):
-    """True if 4 cards within a 5-card window (open-ended or gutshot)."""
-    vals = sorted(set(_rank(c) for c in _clean(hole + board)))
+    vals = sorted(set(RANK_VAL[c[0]] for c in _clean(hole + board)))
     if 12 in vals:
         vals = [-1] + vals
     for start in range(-1, 10):
@@ -86,378 +109,250 @@ def has_straight_draw(hole, board):
     return False
 
 
-def made_hand_strength(hole, board):
-    """
-    Returns hand category (0=high card … 8=straight flush) using
-    the best 5 from hole+board.
-    """
-    from itertools import combinations
-
-    all_cards = _clean(hole + board)
-    if len(all_cards) < 2:
-        return -1
-
-    def _eval5(cards):
-        rv = sorted((_rank(c) for c in cards), reverse=True)
-        from collections import Counter
-        rc = Counter(rv)
-        counts = sorted(rc.items(), key=lambda x: (x[1], x[0]), reverse=True)
-        is_flush = len({c[1] for c in cards}) == 1
-        unique = sorted(set(rv))
-        if 12 in unique:
-            unique = [-1] + unique
-        straight_high = None
-        run = 1
-        for i in range(1, len(unique)):
-            if unique[i] == unique[i - 1] + 1:
-                run += 1
-                if run >= 5:
-                    straight_high = unique[i]
-            else:
-                run = 1
-        if is_flush and straight_high is not None:
-            return (8, straight_high)
-        if counts[0][1] == 4:
-            return (7,)
-        if counts[0][1] == 3 and counts[1][1] == 2:
-            return (6,)
-        if is_flush:
-            return (5,)
-        if straight_high is not None:
-            return (4, straight_high)
-        if counts[0][1] == 3:
-            return (3,)
-        if counts[0][1] == 2 and counts[1][1] == 2:
-            return (2,)
-        if counts[0][1] == 2:
-            return (1,)
-        return (0,)
-
-    if len(all_cards) < 5:
-        return -1
-
-    best = max(_eval5(combo) for combo in combinations(all_cards, 5))
-    return best[0]
+def _num_sims(clock):
+    """Scale simulation count with remaining game clock."""
+    if clock > 100: return 700
+    if clock >  60: return 500
+    if clock >  30: return 300
+    if clock >  10: return 180
+    return 80
 
 
-# ── Board texture analysis ─────────────────────────────────────────────────────
-
-def board_flush_threat(board):
-    """
-    Returns (suit, [indices]) if 3+ board cards share a suit, else None.
-    """
-    suit_indices = {}
-    for i, c in enumerate(board):
-        s = c[1]
-        suit_indices.setdefault(s, []).append(i)
-    for suit, idxs in suit_indices.items():
-        if len(idxs) >= 3:
-            return suit, idxs
-    return None
+def _redraw_inner_sims(clock):
+    return max(50, _num_sims(clock) // 6)
 
 
-def board_straight_threat(board):
-    """
-    Returns list of board indices forming a 4-card straight draw, else None.
-    """
-    val_to_idx = {}
-    for i, c in enumerate(board):
-        val_to_idx.setdefault(_rank(c), []).append(i)
-    vals = sorted(val_to_idx.keys())
-    if 12 in vals:
-        vals_ext = [-1] + vals
-    else:
-        vals_ext = vals
-    for start in range(-1, 10):
-        window = list(range(start, start + 5))
-        matching_vals = [v for v in window if v in val_to_idx]
-        if len(matching_vals) >= 4:
-            indices = []
-            for v in matching_vals:
-                indices.extend(val_to_idx[v])
-            return indices[:4]
-    return None
-
-
-# ── Redraw logic ───────────────────────────────────────────────────────────────
-
-def best_hole_redraw(hole, board, equity, street):
-    """
-    Returns hole card index (0 or 1) to redraw, or None.
-    Only redraw if equity is below threshold and gain is large enough.
-    """
-    if equity >= REDRAW_EQUITY_CEIL.get(street, 0.52):
-        return None
-
-    # Don't redraw if we have a strong made hand
-    strength = made_hand_strength(hole, board)
-    if strength >= 2:  # two pair or better
-        return None
-
-    # Don't redraw if we have a strong draw
-    if has_flush_draw(hole, board) or has_straight_draw(hole, board):
-        if strength >= 1:
-            return None
-
-    # Find which hole card contributes least
-    weakest = 0 if _rank(hole[0]) <= _rank(hole[1]) else 1
-
-    # Verify equity gain is worth it by quick sampling
-    gain = _estimate_hole_redraw_gain(hole, board, weakest, equity)
-    if gain >= REDRAW_GAIN_THRESHOLD.get(street, 0.04):
-        return weakest
-    return None
-
-
-def _estimate_hole_redraw_gain(hole, board, swap_idx, base_equity, n_replacements=8):
-    """Average equity improvement from replacing hole[swap_idx]."""
-    import numpy as np
-    known = set(_clean(hole + board))
-    deck = [r + s for r in RANKS for s in SUITS if (r + s) not in known]
-    if not deck:
-        return 0.0
-    replacements = np.random.choice(deck, size=min(n_replacements, len(deck)), replace=False)
-    total = 0.0
-    for rep in replacements:
-        new_hole = list(hole)
-        new_hole[swap_idx] = rep
-        total += estimate_equity(new_hole, board, n_simulations=150)
-    avg = total / len(replacements)
-    return avg - base_equity
-
-
-def best_board_redraw(hole, board, street, made_strength):
-    """
-    Returns board card index to redraw when protecting a made hand, or None.
-
-    Strategy: if the board has a dangerous flush or straight draw and we have
-    a made hand (pair+), remove the most threatening board card.
-    """
-    if made_strength < 1:
-        return None
-    if not board:
-        return None
-
-    max_board_idx = 2 if street == 3 else 3  # flop: 0-2, turn: 0-3
-
-    # Flush threat — remove highest ranked card of the threatening suit
-    flush_result = board_flush_threat(board)
-    if flush_result is not None:
-        suit, idxs = flush_result
-        # Filter to legal indices
-        legal = [i for i in idxs if i <= max_board_idx]
-        if legal:
-            return max(legal, key=lambda i: _rank(board[i]))
-
-    # Straight threat on the board — remove a connector
-    straight_idxs = board_straight_threat(board)
-    if straight_idxs is not None:
-        legal = [i for i in straight_idxs if i <= max_board_idx]
-        if legal:
-            # Remove the middle connector (hardest to replace)
-            return sorted(legal)[len(legal) // 2]
-
-    return None
-
-
-# ── Bet sizing ─────────────────────────────────────────────────────────────────
-
-def compute_raise(equity, pot, my_stack, continue_cost, round_state, opp_multiplier=1.0):
-    """Scale raise size by equity strength, adjusted for opponent type."""
-    min_raise, max_raise = round_state.raise_bounds()
-
-    if equity >= 0.85:
-        fraction = 1.8
-    elif equity >= 0.75:
-        fraction = 1.2
-    elif equity >= 0.65:
-        fraction = 0.75
-    else:
-        fraction = 0.45  # semi-bluff / thin value
-
-    base = round_state.pips[round_state.button % 2] + continue_cost
-    target = int(base + max(BIG_BLIND * 2, pot * fraction * opp_multiplier))
-
-    # Shove if we're short-stacked or very strong
-    if equity >= 0.90 or my_stack <= BIG_BLIND * 6:
-        target = max_raise
-
-    return max(min_raise, min(max_raise, target))
-
-
-# ── Main bot ───────────────────────────────────────────────────────────────────
+# ── Bot ────────────────────────────────────────────────────────────────────────
 
 class Player(Bot):
 
     def __init__(self):
-        self.opp = OpponentModel()
-
-        # Per-hand state
-        self._preflop_opp_pip_seen = False   # did we observe opp raise preflop?
-        self._my_raised_street = set()       # streets where I raised (for 3bet tracking)
-        self._opp_bet_streets = set()        # streets where opp showed aggression
-        self._last_street = -1
+        self.opp              = OpponentModel()
+        self._last_street     = -1
+        self._i_checked       = False
+        self._raised_streets  = set()
+        self._opp_bet_streets = set()
 
     def handle_new_round(self, game_state, round_state, active):
         self.opp.new_hand()
-        self._preflop_opp_pip_seen = False
-        self._my_raised_street = set()
+        self._last_street     = -1
+        self._i_checked       = False
+        self._raised_streets  = set()
         self._opp_bet_streets = set()
-        self._last_street = -1
 
     def handle_round_over(self, game_state, terminal_state, active):
-        delta = terminal_state.deltas[active]
+        prev      = terminal_state.previous_state
         opp_delta = terminal_state.deltas[1 - active]
+        if prev is not None and opp_delta < 0:
+            self.opp.saw_fold(after_my_raise=bool(self._raised_streets))
 
-        # Infer if opponent folded: they lost chips but only the blind amount
-        prev = terminal_state.previous_state
-        if prev is not None:
-            last_street = prev.street
-            # If hand ended preflop or flop, opp likely folded early
-            if last_street <= 3 and opp_delta < 0:
-                after_my_raise = bool(self._my_raised_street)
-                self.opp.saw_fold(after_my_raise=after_my_raise)
+    # ── Opponent observation ───────────────────────────────────────────
 
-    def _observe_opp_action(self, round_state, active, continue_cost):
-        """Update opponent model based on observable state."""
+    def _observe_opp(self, round_state, active, continue_cost):
         street = round_state.street
-        opp = 1 - active
-
+        opp    = 1 - active
         if continue_cost > 0 and street not in self._opp_bet_streets:
             self._opp_bet_streets.add(street)
             if street == 0:
-                # Preflop raise: opp put in more than the big blind
                 if round_state.pips[opp] > BIG_BLIND:
                     self.opp.saw_preflop_raise()
                 else:
                     self.opp.saw_preflop_call()
             else:
                 self.opp.saw_postflop_bet()
-        elif continue_cost == 0 and street > 0:
-            # Opponent checked
-            if street not in self._opp_bet_streets:
-                self.opp.saw_postflop_check()
-
-        # 3-bet tracking: if I raised this street and opp is calling
-        if street in self._my_raised_street and continue_cost == 0:
+        elif continue_cost == 0 and street > 0 and street not in self._opp_bet_streets:
+            self.opp.saw_postflop_check()
+        if street in self._raised_streets and continue_cost == 0:
             self.opp.saw_call_to_raise()
 
+    # ── Simulation-based redraw ────────────────────────────────────────
+
+    def _redraw_gain(self, hole, board, t_type, t_idx, base_eq, clock):
+        known = set(_clean(hole + board))
+        deck  = [c for c in FULL_DECK if c not in known]
+        if not deck:
+            return 0.0
+        n     = 6 if clock > 20 else 4
+        inner = _redraw_inner_sims(clock)
+        picks = np.random.choice(deck, size=min(n, len(deck)), replace=False)
+        total = 0.0
+        for rep in picks:
+            if t_type == 'hole':
+                h2 = list(hole); h2[t_idx] = rep
+                b2 = list(board)
+            else:
+                h2 = list(hole)
+                b2 = list(board)
+                if t_idx < len(b2):
+                    b2[t_idx] = rep
+            total += estimate_equity(_clean(h2), _clean(b2), n_simulations=inner)
+        return total / len(picks) - base_eq
+
+    def _best_redraw(self, hole, board, street, equity, round_state, active, clock):
+        if round_state.redraws_used[active] or street >= 5:
+            return None
+        if equity >= 0.88:
+            return None
+        min_gain  = 0.055 if clock > 25 else 0.07
+        best      = None
+        best_gain = min_gain
+        for idx in (0, 1):
+            g = self._redraw_gain(hole, board, 'hole', idx, equity, clock)
+            if g > best_gain:
+                best_gain, best = g, ('hole', idx)
+        max_bi = 2 if street == 3 else 3
+        for idx in range(min(len(board), max_bi + 1)):
+            if board[idx] and board[idx] != '??':
+                g = self._redraw_gain(hole, board, 'board', idx, equity, clock)
+                if g > best_gain:
+                    best_gain, best = g, ('board', idx)
+        return best
+
+    # ── Raise sizing ───────────────────────────────────────────────────
+
+    def _size_raise(self, equity, pot, my_stack, continue_cost, round_state, mult):
+        mn, mx = round_state.raise_bounds()
+        if   equity >= 0.85: frac = 1.8
+        elif equity >= 0.75: frac = 1.2
+        elif equity >= 0.65: frac = 0.75
+        else:                frac = 0.45
+        active = round_state.button % 2
+        base   = round_state.pips[active] + continue_cost
+        target = int(base + max(BIG_BLIND * 2, pot * frac * mult))
+        if equity >= 0.90 or my_stack <= BIG_BLIND * 6:
+            target = mx
+        return max(mn, min(mx, target))
+
+    # ── Main action ────────────────────────────────────────────────────
+
     def get_action(self, game_state, round_state, active):
-        legal_actions = round_state.legal_actions()
+        legal  = round_state.legal_actions()
         street = round_state.street
+        clock  = float(game_state.game_clock)
 
-        my_pip = round_state.pips[active]
-        opp_pip = round_state.pips[1 - active]
-        my_stack = round_state.stacks[active]
+        if street != self._last_street:
+            self._i_checked   = False
+            self._last_street = street
+
+        my_pip        = round_state.pips[active]
+        opp_pip       = round_state.pips[1 - active]
         continue_cost = opp_pip - my_pip
-        pot = (STARTING_STACK - round_state.stacks[0]) + (STARTING_STACK - round_state.stacks[1])
-
-        hole = _clean(round_state.hands[active])
-        board = _clean(round_state.board)
-
-        self._observe_opp_action(round_state, active, continue_cost)
-
-        # ── Equity ────────────────────────────────────────────────────
-        if street == 0:
-            equity = preflop_strength(hole)
-        else:
-            equity = estimate_equity(hole, board, n_simulations=SIMS.get(street, 800))
-
-        # ── Opponent adjustments ──────────────────────────────────────
-        call_adj = self.opp.call_equity_adj()
-        raise_adj = self.opp.raise_equity_adj()
-        size_mult = self.opp.bet_size_multiplier()
-
+        my_stack      = round_state.stacks[active]
+        pot           = (STARTING_STACK - round_state.stacks[0]) + \
+                        (STARTING_STACK - round_state.stacks[1])
         pot_odds = continue_cost / (pot + continue_cost) if continue_cost > 0 else 0.0
 
-        # ── Redraw decision ───────────────────────────────────────────
-        if RedrawAction in legal_actions and not round_state.redraws_used[active]:
-            redraw = self._decide_redraw(hole, board, equity, street, made_hand_strength(hole, board))
-            if redraw is not None:
-                target_type, target_idx = redraw
-                bet = self._decide_bet(
-                    equity, pot, my_stack, continue_cost, pot_odds,
-                    call_adj, raise_adj, size_mult, legal_actions, round_state, street, hole, board
-                )
-                return RedrawAction(target_type, target_idx, bet)
+        hole  = _clean(round_state.hands[active])
+        board = _clean(round_state.board)
 
-        # ── Betting decision ──────────────────────────────────────────
-        return self._decide_bet(
-            equity, pot, my_stack, continue_cost, pot_odds,
-            call_adj, raise_adj, size_mult, legal_actions, round_state, street, hole, board
-        )
+        self._observe_opp(round_state, active, continue_cost)
 
-    def _decide_redraw(self, hole, board, equity, street, made_strength):
-        """
-        Returns (target_type, target_index) or None.
-        Prioritizes board redraw (protecting made hand) over hole card swap.
-        """
-        if street not in (3, 4):
-            return None
+        equity = preflop_equity(hole) if street == 0 else \
+                 estimate_equity(hole, board, n_simulations=_num_sims(clock))
 
-        # Board redraw: protect a made hand from dangerous board texture
-        # Only worth it on the flop (2 cards left) or early turn
-        if made_strength >= 1:
-            board_idx = best_board_redraw(hole, board, street, made_strength)
-            if board_idx is not None:
-                return ('board', board_idx)
+        call_adj  = self.opp.call_equity_adj()
+        raise_adj = self.opp.raise_equity_adj()
+        size_mult = self.opp.bet_size_multiplier()
+        has_draw  = has_flush_draw(hole, board) or has_straight_draw(hole, board)
 
-        # Hole card redraw: swap a weak card when equity is low
-        hole_idx = best_hole_redraw(hole, board, equity, street)
-        if hole_idx is not None:
-            return ('hole', hole_idx)
+        redraw = None
+        if RedrawAction in legal and street in (3, 4):
+            redraw = self._best_redraw(hole, board, street, equity, round_state, active, clock)
 
-        return None
+        if street == 5:
+            action = self._river(equity, pot, my_stack, continue_cost, pot_odds,
+                                 call_adj, raise_adj, size_mult, legal, round_state)
+        else:
+            action = self._preriver(equity, pot, my_stack, continue_cost, pot_odds,
+                                    call_adj, raise_adj, size_mult, legal, round_state,
+                                    street, has_draw)
 
-    def _decide_bet(self, equity, pot, my_stack, continue_cost, pot_odds,
-                    call_adj, raise_adj, size_mult, legal_actions, round_state, street, hole, board):
+        if redraw is not None and RedrawAction in legal:
+            inner  = action.action if isinstance(action, RedrawAction) else action
+            action = RedrawAction(redraw[0], redraw[1], inner)
 
-        flush_draw = has_flush_draw(hole, board)
-        straight_draw = has_straight_draw(hole, board)
-        has_draw = flush_draw or straight_draw
+        inner = action.action if isinstance(action, RedrawAction) else action
+        if isinstance(inner, CheckAction):
+            self._i_checked = True
+        if isinstance(inner, RaiseAction):
+            self._raised_streets.add(street)
 
-        # No cost to continue (check or open bet)
-        if CheckAction in legal_actions:
-            if RaiseAction in legal_actions:
-                # Value bet threshold
-                value_threshold = 0.62 if street == 0 else 0.60
-                # Semi-bluff: raise draws with decent equity
-                semi_bluff = (
-                    has_draw and
-                    equity >= (0.48 + raise_adj) and
-                    street in (3, 4)
-                )
-                if equity >= (value_threshold + raise_adj) or semi_bluff:
-                    amount = compute_raise(equity, pot, my_stack, 0, round_state, size_mult)
-                    self._my_raised_street.add(street)
-                    return RaiseAction(amount)
+        return action
+
+    # ── Pre-river ──────────────────────────────────────────────────────
+
+    def _preriver(self, equity, pot, my_stack, continue_cost, pot_odds,
+                  call_adj, raise_adj, size_mult, legal, round_state, street, has_draw):
+
+        if CheckAction in legal:
+            if RaiseAction in legal:
+                vt         = 0.62 if street == 0 else 0.58
+                semi_bluff = has_draw and equity >= (0.46 + raise_adj) and street in (3, 4)
+                if equity >= (vt + raise_adj) or semi_bluff:
+                    amt = self._size_raise(equity, pot, my_stack, 0, round_state, size_mult)
+                    return RaiseAction(amt)
             return CheckAction()
 
-        # Facing a bet/raise — decide call/raise/fold
-        if RaiseAction in legal_actions:
-            # Strong re-raise
-            reraise_threshold = max(0.70, pot_odds + 0.18)
-            # Semi-bluff re-raise on draws (not vs calling stations)
+        if RaiseAction in legal:
+            if self._i_checked and equity >= (0.68 + raise_adj):
+                amt = self._size_raise(equity, pot, my_stack, continue_cost, round_state, size_mult)
+                return RaiseAction(amt)
+
+            reraise_thresh = max(0.62, pot_odds + 0.12) if self.opp.is_aggressive() \
+                             else max(0.68, pot_odds + 0.15)
             semi_reraise = (
                 has_draw and
-                continue_cost <= max(20, pot // 2) and
-                equity >= (0.44 + raise_adj) and
+                continue_cost <= max(24, pot // 2) and
+                equity >= (0.42 + raise_adj) and
                 street in (3, 4)
             )
-            if equity >= (reraise_threshold + raise_adj) or semi_reraise:
-                amount = compute_raise(equity, pot, my_stack, continue_cost, round_state, size_mult)
-                self._my_raised_street.add(street)
-                return RaiseAction(amount)
+            if equity >= (reraise_thresh + raise_adj) or semi_reraise:
+                amt = self._size_raise(equity, pot, my_stack, continue_cost, round_state, size_mult)
+                return RaiseAction(amt)
 
-        # Call if profitable (pot odds + adjustment)
-        call_threshold = pot_odds + call_adj
-        if CallAction in legal_actions:
-            if equity >= call_threshold - 0.02:
+        if CallAction in legal:
+            if equity >= pot_odds + call_adj - 0.02:
                 return CallAction()
-            # Cheap call — don't fold for tiny bets even with weak equity
             if continue_cost <= BIG_BLIND * 2 and equity >= 0.28:
                 return CallAction()
 
+        if CheckAction in legal:
+            return CheckAction()
+        return FoldAction()
+
+    # ── River ──────────────────────────────────────────────────────────
+
+    def _river(self, equity, pot, my_stack, continue_cost, pot_odds,
+               call_adj, raise_adj, size_mult, legal, round_state):
+        """No semi-bluffs. Value bet strong hands. Pure bluff vs folders."""
+
+        if CheckAction in legal:
+            if RaiseAction in legal:
+                if equity >= (0.60 + raise_adj):
+                    amt = self._size_raise(equity, pot, my_stack, 0, round_state, size_mult)
+                    return RaiseAction(amt)
+                if equity < 0.25 and self.opp.fold_frequency > 0.42 and random.random() < 0.35:
+                    mn, mx    = round_state.raise_bounds()
+                    bluff_amt = max(mn, min(int(pot * 0.5), mx))
+                    return RaiseAction(bluff_amt)
+            return CheckAction()
+
+        if RaiseAction in legal:
+            if self._i_checked and equity >= (0.78 + raise_adj):
+                amt = self._size_raise(equity, pot, my_stack, continue_cost, round_state, size_mult)
+                return RaiseAction(amt)
+            if equity >= max(0.75, pot_odds + 0.20):
+                amt = self._size_raise(equity, pot, my_stack, continue_cost, round_state, size_mult)
+                return RaiseAction(amt)
+
+        if CallAction in legal:
+            if equity >= pot_odds + call_adj:
+                return CallAction()
+            if continue_cost <= BIG_BLIND * 2 and equity >= 0.32:
+                return CallAction()
+
+        if CheckAction in legal:
+            return CheckAction()
         return FoldAction()
 
 
