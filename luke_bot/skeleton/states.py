@@ -199,9 +199,11 @@ class RoundState(
                 # Engine does not transmit the new redraw card directly in action history.
                 # Use a placeholder to preserve shape/indices in local bot state.
                 if target_type == 'hole':
-                    hands[active][target_index] = '??'
+                    if target_index < len(hands[active]):
+                        hands[active][target_index] = '??'
                 else:
-                    board[target_index] = '??'
+                    if target_index < len(board):
+                        board[target_index] = '??'
                 redraws_used[active] = True
                 state_after_redraw = RoundState(
                     self.button,
