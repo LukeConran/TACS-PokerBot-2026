@@ -1,10 +1,10 @@
 # PARAMETERS TO CONTROL THE BEHAVIOR OF THE GAME ENGINE
 # DO NOT REMOVE OR RENAME THIS FILE
-PLAYER_1_NAME = "A"
+PLAYER_1_NAME = "luke_bot"
 # Point each player path at a Python bot directory with commands.json
-PLAYER_1_PATH = "./python_skeleton"
+PLAYER_1_PATH = "./luke_bot"
 # NO TRAILING SLASHES ARE ALLOWED IN PATHS
-PLAYER_2_NAME = "B"
+PLAYER_2_NAME = "check_call_bot"
 PLAYER_2_PATH = "./check_call_bot"
 # GAME PROGRESS IS RECORDED HERE
 GAME_LOG_FILENAME = "gamelog"
