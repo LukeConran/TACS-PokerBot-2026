@@ -1,11 +1,11 @@
 # PARAMETERS TO CONTROL THE BEHAVIOR OF THE GAME ENGINE
 # DO NOT REMOVE OR RENAME THIS FILE
-PLAYER_1_NAME = "A"
+PLAYER_1_NAME = "arman_bot"
 # Point each player path at a Python bot directory with commands.json
-PLAYER_1_PATH = "./python_skeleton"
+PLAYER_1_PATH = "./arman_bot_v2"
 # NO TRAILING SLASHES ARE ALLOWED IN PATHS
-PLAYER_2_NAME = "B"
-PLAYER_2_PATH = "./check_call_bot"
+PLAYER_2_NAME = "arman v1"
+PLAYER_2_PATH = "./python_skeleton"
 # GAME PROGRESS IS RECORDED HERE
 GAME_LOG_FILENAME = "gamelog"
 # OUTPUT DIRECTORY FOR ENGINE LOG FILES
